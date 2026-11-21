@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -15,6 +16,8 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 )
 
+const multipartOverhead = 1 << 20
+
 func uploadFile(w http.ResponseWriter, r *http.Request) {
 	// Get authed user
 	user, err := getUserByToken(r.Header.Get("Authorization"))
@@ -24,9 +27,29 @@ func uploadFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Get maximum file size for bucket
+	maxIconSizeMib, _ := strconv.ParseInt(os.Getenv("MAX_ICON_SIZE_MIB"), 10, 32)
+	maxEmojiSizeMib, _ := strconv.ParseInt(os.Getenv("MAX_EMOJI_SIZE_MIB"), 10, 32)
+	maxStickerSizeMib, _ := strconv.ParseInt(os.Getenv("MAX_STICKER_SIZE_MIB"), 10, 32)
+	maxAttachmentSizeMib, _ := strconv.ParseInt(os.Getenv("MAX_ATTACHMENT_SIZE_MIB"), 10, 32)
+	maxSize := map[string]int64{
+		"icons":       (maxIconSizeMib << 20),
+		"emojis":      (maxEmojiSizeMib << 20),
+		"stickers":    (maxStickerSizeMib << 20),
+		"attachments": (maxAttachmentSizeMib << 20),
+	}[chi.URLParam(r, "bucket")]
+
+	// Stop reading the body once it exceeds the limit (plus room for multipart overhead)
+	r.Body = http.MaxBytesReader(w, r.Body, maxSize+multipartOverhead)
+
 	// Get file from request body
 	file, header, err := r.FormFile("file")
 	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, "File too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		if err != http.ErrMissingFile {
 			sentry.CaptureException(err)
 		}
@@ -36,16 +59,7 @@ func uploadFile(w http.ResponseWriter, r *http.Request) {
 	defer file.Close()
 
 	// Make sure file doesn't exceeed maximum size
-	maxIconSizeMib, _ := strconv.ParseInt(os.Getenv("MAX_ICON_SIZE_MIB"), 10, 32)
-	maxEmojiSizeMib, _ := strconv.ParseInt(os.Getenv("MAX_EMOJI_SIZE_MIB"), 10, 32)
-	maxStickerSizeMib, _ := strconv.ParseInt(os.Getenv("MAX_STICKER_SIZE_MIB"), 10, 32)
-	maxAttachmentSizeMib, _ := strconv.ParseInt(os.Getenv("MAX_ATTACHMENT_SIZE_MIB"), 10, 32)
-	if header.Size > map[string]int64{
-		"icons":       (maxIconSizeMib << 20),
-		"emojis":      (maxEmojiSizeMib << 20),
-		"stickers":    (maxStickerSizeMib << 20),
-		"attachments": (maxAttachmentSizeMib << 20),
-	}[chi.URLParam(r, "bucket")] {
+	if header.Size > maxSize {
 		http.Error(w, "File too large", http.StatusRequestEntityTooLarge)
 		return
 	}
@@ -96,11 +110,12 @@ func downloadFile(w http.ResponseWriter, r *http.Request) {
 
 	// Get object
 	var thumbnail bool
-	if strings.HasPrefix(f.Mime, "image/") && (r.URL.Query().Has("thumbnail") || r.URL.Query().Has("preview")) {
+	if isProcessableImage(f.Mime) && (r.URL.Query().Has("thumbnail") || r.URL.Query().Has("preview")) {
 		thumbnail = true
 	} else if strings.HasPrefix(f.Mime, "video/") && r.URL.Query().Has("thumbnail") {
 		thumbnail = true
 	}
+	thumbnail = thumbnail && f.HasThumbnail()
 	obj, objInfo, err := f.GetObject(thumbnail)
 	if err != nil {
 		sentry.CaptureException(err)
@@ -121,7 +136,7 @@ func downloadFile(w http.ResponseWriter, r *http.Request) {
 	if filename == "" {
 		filename = f.Id
 	}
-	isMedia := strings.HasPrefix(f.Mime, "image/") || strings.HasPrefix(f.Mime, "video/") || strings.HasPrefix(f.Mime, "audio/")
+	isMedia := isProcessableImage(f.Mime) || strings.HasPrefix(f.Mime, "video/") || strings.HasPrefix(f.Mime, "audio/")
 	if r.URL.Query().Has("download") || !isMedia {
 		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename=%s`, filename))
 	} else {

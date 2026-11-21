@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policymap [
+  <!ELEMENT policymap (policy)*>
+  <!ATTLIST policymap xmlns CDATA #FIXED "">
+  <!ELEMENT policy EMPTY>
+  <!ATTLIST policy xmlns CDATA #FIXED "">
+  <!ATTLIST policy domain NMTOKEN #REQUIRED>
+  <!ATTLIST policy name NMTOKEN #IMPLIED>
+  <!ATTLIST policy pattern CDATA #IMPLIED>
+  <!ATTLIST policy rights NMTOKEN #IMPLIED>
+  <!ATTLIST policy stealth NMTOKEN #IMPLIED>
+  <!ATTLIST policy value CDATA #IMPLIED>
+]>
+<!-- Restrictive policy for processing untrusted uploads. -->
+<policymap>
+  <!-- Resource limits -->
+  <policy domain="resource" name="memory" value="256MiB"/>
+  <policy domain="resource" name="map" value="512MiB"/>
+  <policy domain="resource" name="disk" value="1GiB"/>
+  <policy domain="resource" name="area" value="128MP"/>
+  <policy domain="resource" name="width" value="16KP"/>
+  <policy domain="resource" name="height" value="16KP"/>
+  <policy domain="resource" name="list-length" value="1000"/>
+  <policy domain="resource" name="thread" value="2"/>
+  <policy domain="resource" name="time" value="60"/>
+  <policy domain="resource" name="file" value="768"/>
+
+  <!-- No delegates, filters, indirect reads (@file) or remote/pseudo inputs -->
+  <policy domain="delegate" rights="none" pattern="*"/>
+  <policy domain="filter" rights="none" pattern="*"/>
+  <policy domain="path" rights="none" pattern="@*"/>
+  <policy domain="module" rights="none" pattern="{MSL,MVG,PS,PDF,SVG,TEXT,TXT,LABEL,CAPTION,URL,EPHEMERAL,VIDEO,XPS}"/>
+  <policy domain="coder" rights="none" pattern="{HTTP,HTTPS,FTP,URL,EPHEMERAL,SVG,MSVG,RSVG,MVG,MSL,TEXT,TXT,LABEL,CAPTION,PANGO}"/>
+
+  <!-- Only allow the raster formats the service handles -->
+  <policy domain="coder" rights="none" pattern="*"/>
+  <policy domain="coder" rights="read | write" pattern="{PNG,JPEG,GIF,WEBP}"/>
+</policymap>

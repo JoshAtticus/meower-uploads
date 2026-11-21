@@ -9,5 +9,6 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o Meower-Uploads
 FROM alpine
 WORKDIR /app
 RUN apk add --no-cache coreutils file imagemagick ffmpeg
+COPY policy.xml /etc/ImageMagick-7/policy.xml
 COPY --from=builder /app/Meower-Uploads /app/Meower-Uploads
 ENTRYPOINT ["/app/Meower-Uploads"]
