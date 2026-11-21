@@ -160,6 +160,7 @@ func IngestMultipartFile(
 	}
 	coder, isImage := imageCoder(f.Mime)
 	originalCoderPath := fmt.Sprint(coder, ":", originalPath)
+	objectPath := originalPath
 
 	// Get dimensions, if it is an image
 	if isImage {
@@ -192,6 +193,7 @@ func IngestMultipartFile(
 		}
 		outputCoder, _ := imageCoder(f.Mime)
 		outputPath := fmt.Sprint(ingestDir, "/.", format)
+		objectPath = outputPath
 
 		// If one of the axis is less than n, use that size rather than n
 		var desiredSize int
@@ -259,6 +261,7 @@ func IngestMultipartFile(
 		if isImage { // Images
 			// Remove Exif and optimize
 			optimizedPath := fmt.Sprint(ingestDir, "/optimized")
+			objectPath = optimizedPath
 			if _, err := runMagick(
 				originalCoderPath,
 				"-quality",
@@ -363,13 +366,41 @@ func IngestMultipartFile(
 		sentry.CaptureException(err)
 		return nil, err
 	}
-	err = f.insert()
+	err = f.restoreRemovedObjects(objectPath)
+	if err == nil {
+		err = f.insert()
+	}
 	unlock()
 	if err != nil {
 		return &f, err
 	}
 
 	return &f, nil
+}
+
+// Cleanup may have removed the objects of an older row with the same hash while
+// this file was being processed. Must be called while holding the hash lock.
+func (f *File) restoreRemovedObjects(objectPath string) error {
+	if !objectExists(f.Bucket, f.Hash) {
+		if _, err := s3Clients[s3RegionOrder[0]].FPutObject(
+			ctx,
+			f.Bucket,
+			f.Hash,
+			objectPath,
+			minio.PutObjectOptions{
+				ContentType: f.Mime,
+			},
+		); err != nil {
+			sentry.CaptureException(err)
+			return err
+		}
+	}
+	if f.ThumbnailMime != "" && !objectExists(f.Bucket, f.Hash+"_thumbnail") {
+		// Regenerated on the next thumbnail request
+		f.ThumbnailMime = ""
+		f.ThumbnailSize = 0
+	}
+	return nil
 }
 
 func (f *File) insert() error {
