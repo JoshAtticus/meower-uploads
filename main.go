@@ -34,6 +34,7 @@ func main() {
 
 	// Load dotenv
 	godotenv.Load()
+	mediaSem = make(chan struct{}, maxMediaJobs())
 
 	// Initialise Sentry
 	sentry.Init(sentry.ClientOptions{

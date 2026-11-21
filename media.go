@@ -44,7 +44,8 @@ var magickLimits = []string{
 	"-limit", "time", "60",
 }
 
-var mediaSem = make(chan struct{}, maxMediaJobs())
+// Initialised in main once the environment has been loaded
+var mediaSem chan struct{}
 
 func maxMediaJobs() int {
 	if n, err := strconv.Atoi(os.Getenv("MAX_MEDIA_JOBS")); err == nil && n > 0 {
