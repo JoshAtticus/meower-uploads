@@ -2,12 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
 	"os"
-	"os/exec"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -49,7 +48,6 @@ func IngestMultipartFile(
 	var wg sync.WaitGroup
 	var err error
 	var id, hashHex string
-	var info minio.UploadInfo
 
 	// Create file ID
 	id, err = generateId()
@@ -65,9 +63,10 @@ func IngestMultipartFile(
 		sentry.CaptureException(err)
 		return nil, err
 	}
+	originalPath := fmt.Sprint(ingestDir, "/original")
 
 	// Save file
-	dst, err := os.Create(fmt.Sprint(ingestDir, "/original"))
+	dst, err := os.Create(originalPath)
 	if err != nil {
 		sentry.CaptureException(err)
 		return nil, err
@@ -80,29 +79,23 @@ func IngestMultipartFile(
 
 	// "Ultra HD"
 	if uploader.Flags&FlagUltraHDUploads != 0 {
-		out, _ := exec.Command(
-			"file",
-			"--mime-type",
-			fmt.Sprint(ingestDir, "/original"),
-		).Output()
-		if strings.HasPrefix(strings.Fields(string(out))[1], "image/") {
-			exec.Command(
-				"magick",
-				fmt.Sprint(ingestDir, "/original"),
-				"-quality",
-				"5",
-				fmt.Sprint(ingestDir, "/original.jpg"),
-			).Run()
-			os.Rename(fmt.Sprint(ingestDir, "/original.jpg"), fmt.Sprint(ingestDir, "/original"))
+		if mime, err := detectMime(originalPath); err == nil {
+			if coder, ok := imageCoder(mime); ok {
+				if _, err := runMagick(
+					fmt.Sprint(coder, ":", originalPath),
+					"-quality",
+					"5",
+					fmt.Sprint("JPEG:", originalPath, ".jpg"),
+				); err == nil {
+					os.Rename(fmt.Sprint(originalPath, ".jpg"), originalPath)
+				}
+			}
 		}
 	}
 
 	// Get file hash
 	var out []byte
-	out, err = exec.Command(
-		"sha256sum",
-		fmt.Sprint(ingestDir, "/original"),
-	).Output()
+	out, err = runCommand(utilTimeout, "sha256sum", originalPath)
 	if err != nil {
 		sentry.CaptureException(err)
 		return nil, err
@@ -111,292 +104,278 @@ func IngestMultipartFile(
 
 	// Make sure file isn't blocked
 	if blocked, err := getBlockStatus(hashHex); blocked || err != nil {
-		os.Remove(fmt.Sprint(ingestDir, "/original"))
+		os.Remove(originalPath)
 		if blocked {
 			return nil, ErrFileBlocked
 		}
 		return nil, err
 	}
 
-	// Attempt to get existing file details
+	// Reuse existing object if there is one.
+	// The lock stops cleanup from removing the object between the lookup and the insert.
+	unlock, err := lockFileHash(bucket, hashHex)
+	if err != nil {
+		sentry.CaptureException(err)
+		return nil, err
+	}
 	err = db.Collection("files").FindOne(
 		context.TODO(),
 		bson.M{"hash": hashHex, "bucket": bucket},
 	).Decode(&f)
 	if err != nil && err != mongo.ErrNoDocuments {
+		unlock()
 		return nil, err
 	}
-
-	// Process and save file
-	if f.Hash == hashHex {
+	if f.Hash == hashHex && objectExists(bucket, hashHex) {
 		f.Id = id
 		f.Filename = cleanFilename(fileHeader.Filename)
 		f.UploadedBy = uploader.Username
 		f.UploadedAt = time.Now().Unix()
 		f.Claimed = false
-	} else {
-		// Create file details
-		f = File{
-			Id:           id,
-			Hash:         hashHex,
-			Bucket:       bucket,
-			Filename:     cleanFilename(fileHeader.Filename),
-			UploadRegion: s3RegionOrder[0],
-			UploadedBy:   uploader.Username,
-			UploadedAt:   time.Now().Unix(),
+		err = f.insert()
+		unlock()
+		if err != nil {
+			return &f, err
 		}
+		return &f, nil
+	}
+	unlock()
 
-		// Get mime
-		out, err = exec.Command(
-			"file",
-			"--mime-type",
-			fmt.Sprint(ingestDir, "/original"),
-		).Output()
+	// Create file details
+	f = File{
+		Id:           id,
+		Hash:         hashHex,
+		Bucket:       bucket,
+		Filename:     cleanFilename(fileHeader.Filename),
+		UploadRegion: s3RegionOrder[0],
+		UploadedBy:   uploader.Username,
+		UploadedAt:   time.Now().Unix(),
+	}
+
+	// Get mime
+	f.Mime, err = detectMime(originalPath)
+	if err != nil {
+		sentry.CaptureException(err)
+		return nil, err
+	}
+	coder, isImage := imageCoder(f.Mime)
+	originalCoderPath := fmt.Sprint(coder, ":", originalPath)
+
+	// Get dimensions, if it is an image
+	if isImage {
+		f.Width, f.Height, err = identifyDimensions(originalCoderPath)
 		if err != nil {
 			sentry.CaptureException(err)
 			return nil, err
 		}
-		f.Mime = strings.Fields(string(out))[1]
+	}
 
-		// Get dimensions and number of frames, if it is an image
-		if strings.HasPrefix(f.Mime, "image/") {
-			out, err = exec.Command(
-				"magick",
-				"identify",
-				"-format",
-				"%w,%h",
-				fmt.Sprint(ingestDir, "/original"),
-			).Output()
-			if err != nil {
-				sentry.CaptureException(err)
-				return nil, err
-			}
-			outSlice := strings.Split(string(out), ",")
-			f.Width, _ = strconv.Atoi(outSlice[0])
-			f.Height, _ = strconv.Atoi(outSlice[1])
+	if bucket == "icons" || bucket == "emojis" || bucket == "stickers" {
+		// Make sure the file is a supported image
+		if !isImage {
+			return nil, ErrUnsupportedFile
 		}
 
-		if bucket == "icons" || bucket == "emojis" || bucket == "stickers" {
-			// Make sure the file is an image
-			if !strings.HasPrefix(f.Mime, "image/") {
-				return nil, ErrUnsupportedFile
-			}
+		// Get frames
+		frames, err := identifyFrames(originalCoderPath)
+		if err != nil {
+			sentry.CaptureException(err)
+			return nil, err
+		}
 
-			// Get frames
-			out, err = exec.Command(
-				"magick",
-				"identify",
-				"-format",
-				"%n",
-				fmt.Sprint(ingestDir, "/original"),
-			).Output()
-			if err != nil {
-				sentry.CaptureException(err)
-				return nil, err
-			}
-			frames := string(out)
+		// Choose format to convert to and update mime
+		format := "webp"
+		f.Mime = "image/webp"
+		if frames != 1 {
+			format = "gif"
+			f.Mime = "image/gif"
+		}
+		outputCoder, _ := imageCoder(f.Mime)
+		outputPath := fmt.Sprint(ingestDir, "/.", format)
 
-			// Choose format to convert to and update mime
-			format := "webp"
-			f.Mime = "image/webp"
-			if frames != "1" {
-				format = "gif"
-				f.Mime = "image/gif"
-			}
+		// If one of the axis is less than n, use that size rather than n
+		var desiredSize int
+		switch bucket {
+		case "icons":
+			desiredSize = 256
+		case "emojis":
+			desiredSize = 128
+		case "stickers":
+			desiredSize = 384
+		}
+		if f.Width < desiredSize {
+			desiredSize = f.Width
+		} else if f.Height < desiredSize {
+			desiredSize = f.Height
+		}
 
-			// If one of the axis is less than n, use that size rather than n
-			var desiredSize int
-			switch bucket {
-			case "icons":
-				desiredSize = 256
-			case "emojis":
-				desiredSize = 128
-			case "stickers":
-				desiredSize = 384
-			}
-			if f.Width < desiredSize {
-				desiredSize = f.Width
-			} else if f.Height < desiredSize {
-				desiredSize = f.Height
-			}
+		// Remove Exif, optimize, and resize
+		if _, err := runMagick(
+			originalCoderPath,
+			"-quality",
+			"90",
+			"-resize",
+			fmt.Sprint(desiredSize, "x", desiredSize),
+			"-auto-orient",
+			"-strip",
+			fmt.Sprint(outputCoder, ":", outputPath),
+		); err != nil {
+			sentry.CaptureException(err)
+			return nil, err
+		}
 
-			// Remove Exif, optimize, and resize
-			err = exec.Command(
-				"magick",
-				fmt.Sprint(ingestDir, "/original"),
+		// Upload to bucket
+		var uploadErr, identifyErr error
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var info minio.UploadInfo
+			info, uploadErr = s3Clients[s3RegionOrder[0]].FPutObject(
+				ctx,
+				bucket,
+				hashHex,
+				outputPath,
+				minio.PutObjectOptions{
+					ContentType: f.Mime,
+				},
+			)
+			f.Size = info.Size
+		}()
+
+		// Get new width and height
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			f.Width, f.Height, identifyErr = identifyDimensions(fmt.Sprint(outputCoder, ":", outputPath))
+		}()
+
+		wg.Wait()
+
+		if err := errors.Join(uploadErr, identifyErr); err != nil {
+			sentry.CaptureException(err)
+			return nil, err
+		}
+	} else if bucket == "attachments" {
+		if isImage { // Images
+			// Remove Exif and optimize
+			optimizedPath := fmt.Sprint(ingestDir, "/optimized")
+			if _, err := runMagick(
+				originalCoderPath,
 				"-quality",
 				"90",
-				"-resize",
-				fmt.Sprint(desiredSize, "x", desiredSize),
 				"-auto-orient",
 				"-strip",
-				fmt.Sprint(ingestDir, "/.", format),
-			).Run()
-			if err != nil {
+				fmt.Sprint(coder, ":", optimizedPath),
+			); err != nil {
 				sentry.CaptureException(err)
 				return nil, err
 			}
 
-			// Upload to bucket
+			// Upload optimized to bucket
+			var uploadErr, thumbnailErr error
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				info, err = s3Clients[s3RegionOrder[0]].FPutObject(
+				var info minio.UploadInfo
+				info, uploadErr = s3Clients[s3RegionOrder[0]].FPutObject(
 					ctx,
 					bucket,
 					hashHex,
-					fmt.Sprint(ingestDir, "/.", format),
-					minio.PutObjectOptions{
-						ContentType: fmt.Sprint("image/", format),
-					},
-				)
-				f.Size = info.Size
-			}()
-
-			// Get new width and height
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				out, _ = exec.Command(
-					"magick",
-					"identify",
-					"-format",
-					"%w,%h",
-					fmt.Sprint(ingestDir, "/.", format),
-				).Output()
-				outSlice := strings.Split(string(out), ",")
-				f.Width, _ = strconv.Atoi(outSlice[0])
-				f.Height, _ = strconv.Atoi(outSlice[1])
-			}()
-
-			wg.Wait()
-		} else if bucket == "attachments" {
-			if strings.HasPrefix(f.Mime, "image") { // Images
-				// Remove Exif and optimize
-				err = exec.Command(
-					"magick",
-					fmt.Sprint(ingestDir, "/original"),
-					"-quality",
-					"90",
-					"-auto-orient",
-					"-strip",
-					fmt.Sprint(ingestDir, "/optimized"),
-				).Run()
-				if err != nil {
-					sentry.CaptureException(err)
-					return nil, err
-				}
-
-				// Upload optimized to bucket
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					info, err = s3Clients[s3RegionOrder[0]].FPutObject(
-						ctx,
-						bucket,
-						hashHex,
-						fmt.Sprint(ingestDir, "/optimized"),
-						minio.PutObjectOptions{
-							ContentType: f.Mime,
-						},
-					)
-					f.Size = info.Size
-				}()
-
-				// Generate thumbnail
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					err = f.GenerateThumbnail()
-				}()
-
-				wg.Wait()
-
-				if err != nil {
-					sentry.CaptureException(err)
-					return nil, err
-				}
-			} else if strings.HasPrefix(f.Mime, "video") { // Videos
-				// Start uploading video to bucket
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					info, err = s3Clients[s3RegionOrder[0]].FPutObject(
-						ctx,
-						bucket,
-						hashHex,
-						fmt.Sprint(ingestDir, "/original"),
-						minio.PutObjectOptions{
-							ContentType: f.Mime,
-						},
-					)
-					f.Size = info.Size
-				}()
-
-				// Get first frame
-				err = exec.Command(
-					"ffmpeg",
-					"-i",
-					fmt.Sprint(ingestDir, "/original"),
-					"-vf",
-					"select=eq(n\\,0)",
-					"-vsync",
-					"vfr",
-					"-q:v",
-					"2",
-					fmt.Sprint(ingestDir, "/first_frame.jpg"),
-				).Run()
-				if err != nil {
-					sentry.CaptureException(err)
-					return nil, err
-				}
-
-				// Get dimensions from first frame
-				out, err = exec.Command(
-					"magick",
-					"identify",
-					"-format",
-					"%w,%h",
-					fmt.Sprint(ingestDir, "/first_frame.jpg"),
-				).Output()
-				if err != nil {
-					sentry.CaptureException(err)
-					return nil, err
-				}
-				outSlice := strings.Split(string(out), ",")
-				f.Width, _ = strconv.Atoi(outSlice[0])
-				f.Height, _ = strconv.Atoi(outSlice[1])
-
-				// Generate thumbnail
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					err = f.GenerateThumbnail()
-				}()
-
-				wg.Wait()
-
-				if err != nil {
-					sentry.CaptureException(err)
-					return nil, err
-				}
-			} else { // Everything else
-				info, err = s3Clients[s3RegionOrder[0]].FPutObject(
-					ctx,
-					bucket,
-					hashHex,
-					fmt.Sprint(ingestDir, "/original"),
+					optimizedPath,
 					minio.PutObjectOptions{
 						ContentType: f.Mime,
 					},
 				)
-				if err != nil {
-					sentry.CaptureException(err)
-					return nil, err
-				}
 				f.Size = info.Size
+			}()
+
+			// Generate thumbnail
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				thumbnailErr = f.GenerateThumbnail()
+			}()
+
+			wg.Wait()
+
+			if err := errors.Join(uploadErr, thumbnailErr); err != nil {
+				sentry.CaptureException(err)
+				return nil, err
 			}
+		} else if strings.HasPrefix(f.Mime, "video/") { // Videos
+			// Start uploading video to bucket
+			var uploadErr, thumbnailErr error
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				var info minio.UploadInfo
+				info, uploadErr = s3Clients[s3RegionOrder[0]].FPutObject(
+					ctx,
+					bucket,
+					hashHex,
+					originalPath,
+					minio.PutObjectOptions{
+						ContentType: f.Mime,
+					},
+				)
+				f.Size = info.Size
+			}()
+
+			// Get first frame and its dimensions
+			firstFramePath := fmt.Sprint(ingestDir, "/first_frame.jpg")
+			err = extractFirstFrame(originalPath, firstFramePath)
+			if err == nil {
+				f.Width, f.Height, err = identifyDimensions(fmt.Sprint("JPEG:", firstFramePath))
+			}
+
+			// Generate thumbnail
+			if err == nil {
+				thumbnailErr = f.GenerateThumbnail()
+			}
+
+			wg.Wait()
+
+			if err := errors.Join(err, uploadErr, thumbnailErr); err != nil {
+				sentry.CaptureException(err)
+				return nil, err
+			}
+		} else { // Everything else
+			info, err := s3Clients[s3RegionOrder[0]].FPutObject(
+				ctx,
+				bucket,
+				hashHex,
+				originalPath,
+				minio.PutObjectOptions{
+					ContentType: f.Mime,
+				},
+			)
+			if err != nil {
+				sentry.CaptureException(err)
+				return nil, err
+			}
+			f.Size = info.Size
 		}
+	}
+
+	// Create database item
+	unlock, err = lockFileHash(bucket, hashHex)
+	if err != nil {
+		sentry.CaptureException(err)
+		return nil, err
+	}
+	err = f.insert()
+	unlock()
+	if err != nil {
+		return &f, err
+	}
+
+	return &f, nil
+}
+
+func (f *File) insert() error {
+	if _, err := db.Collection("files").InsertOne(context.TODO(), f); err != nil {
+		sentry.CaptureException(err)
+		return err
 	}
 
 	// Send to files automod
@@ -406,20 +385,16 @@ func IngestMultipartFile(
 		"file_bucket": f.Bucket,
 		"file_hashes": []string{f.Hash},
 	})
-	if err := rdb.Publish(context.TODO(), "automod:files", marshaledEvent).Err(); err != nil {
+	if err != nil {
+		sentry.CaptureException(err)
+	} else if err := rdb.Publish(context.TODO(), "automod:files", marshaledEvent).Err(); err != nil {
 		fmt.Println(err)
 		sentry.CaptureException(err)
 	}
 
-	// Create database item
-	if _, err := db.Collection("files").InsertOne(context.TODO(), &f); err != nil {
-		sentry.CaptureException(err)
-		return &f, err
-	}
-
 	sentry.CaptureMessage(fmt.Sprintf("Uploaded file %s with hash %s to %s region", f.Id, f.Hash, f.UploadRegion))
 
-	return &f, nil
+	return nil
 }
 
 func GetFile(id string) (File, error) {
@@ -432,9 +407,16 @@ func GetFile(id string) (File, error) {
 }
 
 func (f *File) GenerateThumbnail() error {
+	isVideo := strings.HasPrefix(f.Mime, "video/")
+	coder, isImage := imageCoder(f.Mime)
+	if !isImage && !isVideo {
+		return ErrUnsupportedFile
+	}
+
 	// Create directory in ingest directory for temporary files
 	// And download file for processing
 	ingestDir := fmt.Sprint(os.Getenv("INGEST_DIR"), "/", f.Id)
+	originalPath := fmt.Sprint(ingestDir, "/original")
 	if _, err := os.Stat(ingestDir); os.IsNotExist(err) {
 		defer os.RemoveAll(ingestDir)
 		if err := os.Mkdir(ingestDir, 0700); err != nil {
@@ -447,8 +429,9 @@ func (f *File) GenerateThumbnail() error {
 			sentry.CaptureException(err)
 			return err
 		}
+		defer obj.Close()
 
-		dst, err := os.Create(fmt.Sprint(ingestDir, "/original"))
+		dst, err := os.Create(originalPath)
 		if err != nil {
 			sentry.CaptureException(err)
 			return err
@@ -462,23 +445,17 @@ func (f *File) GenerateThumbnail() error {
 
 	// Choose format to use for the thumbnail
 	format := "webp"
-	if strings.HasPrefix(f.Mime, "image/") { // use GIF for animated images
-		out, err := exec.Command(
-			"magick",
-			"identify",
-			"-format",
-			"%n",
-			fmt.Sprint(ingestDir, "/original"),
-		).Output()
+	if isImage { // use GIF for animated images
+		frames, err := identifyFrames(fmt.Sprint(coder, ":", originalPath))
 		if err != nil {
 			sentry.CaptureException(err)
 			return err
 		}
-		frames := string(out)
-		if frames != "1" {
+		if frames != 1 {
 			format = "gif"
 		}
 	}
+	outputCoder, _ := imageCoder(fmt.Sprint("image/", format))
 
 	// Use largest axis that is smaller than 480px
 	var desiredSize int
@@ -492,38 +469,26 @@ func (f *File) GenerateThumbnail() error {
 	}
 
 	// Get first frame if it's a video
-	if strings.HasPrefix(f.Mime, "video/") {
-		if _, err := os.Stat(fmt.Sprint(ingestDir, "/first_frame.jpg")); os.IsNotExist(err) {
-			if err := exec.Command(
-				"ffmpeg",
-				"-i",
-				fmt.Sprint(ingestDir, "/original"),
-				"-vf",
-				"select=eq(n\\,0)",
-				"-vsync",
-				"vfr",
-				"-q:v",
-				"2",
-				fmt.Sprint(ingestDir, "/first_frame.jpg"),
-			).Run(); err != nil {
+	src := fmt.Sprint(coder, ":", originalPath)
+	if isVideo {
+		firstFramePath := fmt.Sprint(ingestDir, "/first_frame.jpg")
+		if _, err := os.Stat(firstFramePath); os.IsNotExist(err) {
+			if err := extractFirstFrame(originalPath, firstFramePath); err != nil {
 				sentry.CaptureException(err)
 				return err
 			}
 		}
+		src = fmt.Sprint("JPEG:", firstFramePath)
 	}
 
 	// Create thumbnail
-	fp := fmt.Sprint(ingestDir, "/original")
-	if strings.HasPrefix(f.Mime, "video/") {
-		fp = fmt.Sprint(ingestDir, "/first_frame.jpg")
-	}
-	if err := exec.Command(
-		"magick",
-		fp,
+	thumbnailPath := fmt.Sprint(ingestDir, "/thumbnail.", format)
+	if _, err := runMagick(
+		src,
 		"-resize",
 		fmt.Sprint(desiredSize, "x", desiredSize),
-		fmt.Sprint(ingestDir, "/thumbnail.", format),
-	).Run(); err != nil {
+		fmt.Sprint(outputCoder, ":", thumbnailPath),
+	); err != nil {
 		sentry.CaptureException(err)
 		return err
 	}
@@ -533,7 +498,7 @@ func (f *File) GenerateThumbnail() error {
 		ctx,
 		f.Bucket,
 		fmt.Sprint(f.Hash, "_thumbnail"),
-		fmt.Sprint(ingestDir, "/thumbnail.", format),
+		thumbnailPath,
 		minio.PutObjectOptions{
 			ContentType: fmt.Sprint("image/", format),
 		},
@@ -561,9 +526,13 @@ func (f *File) GenerateThumbnail() error {
 	return nil
 }
 
+func (f *File) HasThumbnail() bool {
+	return f.Bucket == "attachments" && (isProcessableImage(f.Mime) || strings.HasPrefix(f.Mime, "video/"))
+}
+
 func (f *File) GetObject(thumbnail bool) (*minio.Object, *minio.ObjectInfo, error) {
 	objName := f.Hash
-	if thumbnail && f.Bucket == "attachments" && (strings.HasPrefix(f.Mime, "image/") || strings.HasPrefix(f.Mime, "video/")) {
+	if thumbnail && f.HasThumbnail() {
 		// Generate thumbnail if one doesn't exist yet
 		if f.ThumbnailMime == "" || f.ThumbnailSize == 0 {
 			if err := f.GenerateThumbnail(); err != nil {
@@ -600,6 +569,14 @@ func (f *File) GetObject(thumbnail bool) (*minio.Object, *minio.ObjectInfo, erro
 }
 
 func (f *File) Delete() error {
+	// Hold the hash lock so a concurrent upload can't start reusing the
+	// objects between the reference check and their removal
+	unlock, err := lockFileHash(f.Bucket, f.Hash)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	// Delete database row
 	if _, err := db.Collection("files").DeleteOne(
 		context.TODO(),
@@ -614,10 +591,17 @@ func (f *File) Delete() error {
 		return err
 	}
 	if !referenced {
+		var wg sync.WaitGroup
 		for _, s3Client := range s3Clients {
-			go s3Client.RemoveObject(ctx, f.Bucket, f.Hash, minio.RemoveObjectOptions{})
-			go s3Client.RemoveObject(ctx, f.Bucket, f.Hash+"_thumbnail", minio.RemoveObjectOptions{})
+			for _, objName := range []string{f.Hash, f.Hash + "_thumbnail"} {
+				wg.Add(1)
+				go func(s3Client *minio.Client, objName string) {
+					defer wg.Done()
+					s3Client.RemoveObject(ctx, f.Bucket, objName, minio.RemoveObjectOptions{})
+				}(s3Client, objName)
+			}
 		}
+		wg.Wait()
 	}
 
 	return nil

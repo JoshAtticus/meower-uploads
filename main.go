@@ -135,7 +135,18 @@ func main() {
 		port = "3000"
 	}
 	log.Println("Serving HTTP server on :" + port)
-	http.ListenAndServe(":"+port, r)
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       5 * time.Minute,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    1 << 20,
+	}
+	if err := srv.ListenAndServe(); err != nil {
+		log.Println(err)
+		sentry.CaptureException(err)
+	}
 
 	// Wait for Sentry events to flush
 	sentry.Flush(time.Second * 5)
