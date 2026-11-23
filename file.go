@@ -164,6 +164,10 @@ func IngestMultipartFile(
 
 	// Get dimensions, if it is an image
 	if isImage {
+		// refuse oversized images from their header before ImageMagick sees them
+		if err := checkImageHeader(originalPath); err != nil {
+			return nil, err
+		}
 		f.Width, f.Height, err = identifyDimensions(originalCoderPath)
 		if err != nil {
 			sentry.CaptureException(err)
