@@ -215,17 +215,25 @@ func IngestMultipartFile(
 			desiredSize = f.Height
 		}
 
-		// Remove Exif, optimize, and resize
-		if _, err := runMagick(
-			originalCoderPath,
+		// Remove Exif, optimize, and resize. Animated images must be coalesced
+		// first, otherwise resizing the partial frames corrupts them (glitchy playback).
+		magickArgs := []string{originalCoderPath}
+		if frames != 1 {
+			magickArgs = append(magickArgs, "-coalesce")
+		}
+		magickArgs = append(magickArgs,
 			"-quality",
 			"90",
 			"-resize",
 			fmt.Sprint(desiredSize, "x", desiredSize),
 			"-auto-orient",
 			"-strip",
-			fmt.Sprint(outputCoder, ":", outputPath),
-		); err != nil {
+		)
+		if frames != 1 {
+			magickArgs = append(magickArgs, "-layers", "optimize")
+		}
+		magickArgs = append(magickArgs, fmt.Sprint(outputCoder, ":", outputPath))
+		if _, err := runMagick(magickArgs...); err != nil {
 			sentry.CaptureException(err)
 			return nil, err
 		}
@@ -238,7 +246,7 @@ func IngestMultipartFile(
 			var info minio.UploadInfo
 			info, uploadErr = s3Clients[s3RegionOrder[0]].FPutObject(
 				ctx,
-				bucket,
+				s3Bucket(bucket),
 				hashHex,
 				outputPath,
 				minio.PutObjectOptions{
@@ -266,14 +274,18 @@ func IngestMultipartFile(
 			// Remove Exif and optimize
 			optimizedPath := fmt.Sprint(ingestDir, "/optimized")
 			objectPath = optimizedPath
-			if _, err := runMagick(
-				originalCoderPath,
-				"-quality",
-				"90",
-				"-auto-orient",
-				"-strip",
-				fmt.Sprint(coder, ":", optimizedPath),
-			); err != nil {
+			optArgs := []string{originalCoderPath}
+			animated := false
+			if n, ferr := identifyFrames(originalCoderPath); ferr == nil && n != 1 {
+				animated = true
+				optArgs = append(optArgs, "-coalesce")
+			}
+			optArgs = append(optArgs, "-quality", "90", "-auto-orient", "-strip")
+			if animated && coder == "GIF" {
+				optArgs = append(optArgs, "-layers", "optimize")
+			}
+			optArgs = append(optArgs, fmt.Sprint(coder, ":", optimizedPath))
+			if _, err := runMagick(optArgs...); err != nil {
 				sentry.CaptureException(err)
 				return nil, err
 			}
@@ -286,7 +298,7 @@ func IngestMultipartFile(
 				var info minio.UploadInfo
 				info, uploadErr = s3Clients[s3RegionOrder[0]].FPutObject(
 					ctx,
-					bucket,
+					s3Bucket(bucket),
 					hashHex,
 					optimizedPath,
 					minio.PutObjectOptions{
@@ -318,7 +330,7 @@ func IngestMultipartFile(
 				var info minio.UploadInfo
 				info, uploadErr = s3Clients[s3RegionOrder[0]].FPutObject(
 					ctx,
-					bucket,
+					s3Bucket(bucket),
 					hashHex,
 					originalPath,
 					minio.PutObjectOptions{
@@ -349,7 +361,7 @@ func IngestMultipartFile(
 		} else { // Everything else
 			info, err := s3Clients[s3RegionOrder[0]].FPutObject(
 				ctx,
-				bucket,
+				s3Bucket(bucket),
 				hashHex,
 				originalPath,
 				minio.PutObjectOptions{
@@ -388,7 +400,7 @@ func (f *File) restoreRemovedObjects(objectPath string) error {
 	if !objectExists(f.Bucket, f.Hash) {
 		if _, err := s3Clients[s3RegionOrder[0]].FPutObject(
 			ctx,
-			f.Bucket,
+			s3Bucket(f.Bucket),
 			f.Hash,
 			objectPath,
 			minio.PutObjectOptions{
@@ -518,12 +530,16 @@ func (f *File) GenerateThumbnail() error {
 
 	// Create thumbnail
 	thumbnailPath := fmt.Sprint(ingestDir, "/thumbnail.", format)
-	if _, err := runMagick(
-		src,
-		"-resize",
-		fmt.Sprint(desiredSize, "x", desiredSize),
-		fmt.Sprint(outputCoder, ":", thumbnailPath),
-	); err != nil {
+	thumbArgs := []string{src}
+	if format == "gif" {
+		thumbArgs = append(thumbArgs, "-coalesce")
+	}
+	thumbArgs = append(thumbArgs, "-resize", fmt.Sprint(desiredSize, "x", desiredSize))
+	if format == "gif" {
+		thumbArgs = append(thumbArgs, "-layers", "optimize")
+	}
+	thumbArgs = append(thumbArgs, fmt.Sprint(outputCoder, ":", thumbnailPath))
+	if _, err := runMagick(thumbArgs...); err != nil {
 		sentry.CaptureException(err)
 		return err
 	}
@@ -531,7 +547,7 @@ func (f *File) GenerateThumbnail() error {
 	// Upload thumbnail
 	uploadInfo, err := s3Clients[s3RegionOrder[0]].FPutObject(
 		ctx,
-		f.Bucket,
+		s3Bucket(f.Bucket),
 		fmt.Sprint(f.Hash, "_thumbnail"),
 		thumbnailPath,
 		minio.PutObjectOptions{
@@ -581,7 +597,7 @@ func (f *File) GetObject(thumbnail bool) (*minio.Object, *minio.ObjectInfo, erro
 	// Get object
 	obj, err := s3Clients[s3RegionOrder[0]].GetObject(
 		ctx,
-		f.Bucket,
+		s3Bucket(f.Bucket),
 		objName,
 		minio.GetObjectOptions{},
 	)
@@ -592,7 +608,7 @@ func (f *File) GetObject(thumbnail bool) (*minio.Object, *minio.ObjectInfo, erro
 	// Get object info (used for size)
 	objInfo, err := s3Clients[s3RegionOrder[0]].StatObject(
 		ctx,
-		f.Bucket,
+		s3Bucket(f.Bucket),
 		objName,
 		minio.StatObjectOptions{},
 	)
@@ -632,7 +648,7 @@ func (f *File) Delete() error {
 				wg.Add(1)
 				go func(s3Client *minio.Client, objName string) {
 					defer wg.Done()
-					s3Client.RemoveObject(ctx, f.Bucket, objName, minio.RemoveObjectOptions{})
+					s3Client.RemoveObject(ctx, s3Bucket(f.Bucket), objName, minio.RemoveObjectOptions{})
 				}(s3Client, objName)
 			}
 		}

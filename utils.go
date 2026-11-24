@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -130,7 +131,13 @@ func lockFileHash(bucket string, hashHex string) (func(), error) {
 	}
 }
 
+// S3 bucket names are globally unique on some providers (e.g. Backblaze B2),
+// so an optional prefix is added to every bucket name.
+func s3Bucket(bucket string) string {
+	return os.Getenv("S3_BUCKET_PREFIX") + bucket
+}
+
 func objectExists(bucket string, objName string) bool {
-	_, err := s3Clients[s3RegionOrder[0]].StatObject(ctx, bucket, objName, minio.StatObjectOptions{})
+	_, err := s3Clients[s3RegionOrder[0]].StatObject(ctx, s3Bucket(bucket), objName, minio.StatObjectOptions{})
 	return err == nil
 }

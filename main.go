@@ -84,6 +84,7 @@ func main() {
 		opts := &minio.Options{
 			Creds:  credentials.NewStaticV4(os.Getenv("MINIO_ACCESS_KEY"), os.Getenv("MINIO_SECRET_KEY"), ""),
 			Secure: os.Getenv("MINIO_SECURE") == "1",
+			Region: os.Getenv("MINIO_REGION"),
 		}
 		if os.Getenv("MINIO_CA_CERT") != "" {
 			caCert, err := os.ReadFile(os.Getenv("MINIO_CA_CERT"))
