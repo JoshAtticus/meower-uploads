@@ -511,8 +511,8 @@ func (f *File) GenerateThumbnail() error {
 	} else {
 		desiredSize = f.Height
 	}
-	if desiredSize > 480 {
-		desiredSize = 480
+	if desiredSize > 1280 {
+		desiredSize = 1280
 	}
 
 	// Get first frame if it's a video
@@ -534,7 +534,7 @@ func (f *File) GenerateThumbnail() error {
 	if format == "gif" {
 		thumbArgs = append(thumbArgs, "-coalesce")
 	}
-	thumbArgs = append(thumbArgs, "-resize", fmt.Sprint(desiredSize, "x", desiredSize))
+	thumbArgs = append(thumbArgs, "-quality", "88", "-resize", fmt.Sprint(desiredSize, "x", desiredSize))
 	if format == "gif" {
 		thumbArgs = append(thumbArgs, "-layers", "optimize")
 	}
