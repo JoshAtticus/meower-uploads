@@ -29,6 +29,7 @@ type File struct {
 	Filename      string `bson:"filename,omitempty" json:"filename,omitempty"`
 	Width         int    `bson:"width,omitempty" json:"width,omitempty"`
 	Height        int    `bson:"height,omitempty" json:"height,omitempty"`
+	Thumbhash     []byte `bson:"thumbhash,omitempty" json:"thumbhash,omitempty"`
 
 	UploadRegion string `bson:"upload_region" json:"-"`
 	UploadedBy   string `bson:"uploaded_by" json:"-"`
@@ -289,6 +290,7 @@ func IngestMultipartFile(
 				sentry.CaptureException(err)
 				return nil, err
 			}
+			f.Thumbhash = computeThumbhash(fmt.Sprint(coder, ":", optimizedPath), ingestDir)
 
 			// Upload optimized to bucket
 			var uploadErr, thumbnailErr error
@@ -345,6 +347,9 @@ func IngestMultipartFile(
 			err = extractFirstFrame(originalPath, firstFramePath)
 			if err == nil {
 				f.Width, f.Height, err = identifyDimensions(fmt.Sprint("JPEG:", firstFramePath))
+			}
+			if err == nil {
+				f.Thumbhash = computeThumbhash(fmt.Sprint("JPEG:", firstFramePath), ingestDir)
 			}
 
 			// Generate thumbnail

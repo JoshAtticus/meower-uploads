@@ -7,13 +7,15 @@ import (
 	"image"
 	_ "image/gif"
 	_ "image/jpeg"
-	_ "image/png"
+	"image/png"
 	"os"
 	"os/exec"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
+
+	"go.n16f.net/thumbhash"
 )
 
 const (
@@ -214,4 +216,30 @@ func checkImageHeader(path string) error {
 		return ErrImageTooLarge
 	}
 	return nil
+}
+
+// Computes a ThumbHash (a tiny blurred preview, ~25 bytes) of an image.
+// Animated images use their first frame. Returns nil if anything fails.
+func computeThumbhash(coderPath string, workDir string) []byte {
+	small := workDir + "/thumbhash_src.png"
+	defer os.Remove(small)
+	if _, err := runMagick(
+		coderPath+"[0]",
+		"-auto-orient",
+		"-resize", "100x100",
+		"-define", "png:color-type=6",
+		"PNG:"+small,
+	); err != nil {
+		return nil
+	}
+	file, err := os.Open(small)
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+	img, err := png.Decode(file)
+	if err != nil {
+		return nil
+	}
+	return thumbhash.EncodeImage(img)
 }
