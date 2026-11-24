@@ -2,15 +2,35 @@ package main
 
 import (
 	"context"
+	"strings"
+	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
 )
 
 const FlagUltraHDUploads int64 = 16 // joke flag
 
+const RestrictionUploading int64 = 32
+
 type User struct {
 	Username string `bson:"_id"`
 	Flags    int64  `bson:"flags"`
+	Ban      struct {
+		State        string `bson:"state"`
+		Restrictions int64  `bson:"restrictions"`
+		Expires      int64  `bson:"expires"`
+	} `bson:"ban"`
+}
+
+// Whether the account is currently banned from uploading files.
+func (u *User) UploadsRestricted() bool {
+	if u.Ban.State == "none" || u.Ban.State == "" {
+		return false
+	}
+	if !strings.Contains(u.Ban.State, "perm") && u.Ban.Expires < time.Now().Unix() {
+		return false
+	}
+	return u.Ban.Restrictions&RestrictionUploading == RestrictionUploading
 }
 
 func getUserByToken(token string) (*User, error) {

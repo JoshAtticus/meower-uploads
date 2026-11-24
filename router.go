@@ -27,6 +27,12 @@ func uploadFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Restricted accounts can't upload
+	if user.UploadsRestricted() {
+		http.Error(w, "Uploading is restricted on this account", http.StatusForbidden)
+		return
+	}
+
 	// Get maximum file size for bucket
 	maxIconSizeMib, _ := strconv.ParseInt(os.Getenv("MAX_ICON_SIZE_MIB"), 10, 32)
 	maxEmojiSizeMib, _ := strconv.ParseInt(os.Getenv("MAX_EMOJI_SIZE_MIB"), 10, 32)
