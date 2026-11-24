@@ -3,7 +3,7 @@ FROM golang AS builder
 WORKDIR /app
 COPY . .
 RUN go mod download
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o Meower-Uploads
+RUN CGO_ENABLED=0 GOOS=linux go build -o Meower-Uploads
 
 # Production stage
 FROM alpine
