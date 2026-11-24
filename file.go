@@ -239,6 +239,8 @@ func IngestMultipartFile(
 			return nil, err
 		}
 
+		f.Thumbhash = computeThumbhash(fmt.Sprint(outputCoder, ":", outputPath), ingestDir)
+
 		// Upload to bucket
 		var uploadErr, identifyErr error
 		wg.Add(1)
