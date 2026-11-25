@@ -33,6 +33,14 @@ func uploadFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Accounts need a verified email to upload (after the grace period)
+	if !user.EmailAllowsUploads() {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"error":true,"type":"emailNotVerified"}`))
+		return
+	}
+
 	// Get maximum file size for bucket
 	maxIconSizeMib, _ := strconv.ParseInt(os.Getenv("MAX_ICON_SIZE_MIB"), 10, 32)
 	maxEmojiSizeMib, _ := strconv.ParseInt(os.Getenv("MAX_EMOJI_SIZE_MIB"), 10, 32)
